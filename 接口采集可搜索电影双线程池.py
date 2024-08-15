@@ -61,11 +61,16 @@ def fetch_category_type():
     return types
 
 
-def fetch_movie_list(type_id, page):
+def fetch_movie_list(type_id, vod_name, page):
     """获取特定类型下的影视列表"""
     url = f"{BASE_URL}?ac=list&t={type_id}&pg={page}"
+    if vod_name:
+        url = f"{BASE_URL}?ac=list&wd={vod_name}"
     logging.info(f"请求url: {url}")
-    logging.info(f"请求影视列表: 类型 ID={type_id}, 页码={page}...")
+    if vod_name:
+        logging.info(f"请求影视列表: 名称={vod_name}...")
+    else:
+        logging.info(f"请求影视列表: 类型 ID={type_id}, 页码={page}...")
     response = requests.get(url)
     return response.json()
 
@@ -100,7 +105,7 @@ def download(mc, urlAttr):
     mc_path = os.path.join(download_path, mc)
     if not os.path.exists(mc_path):
         os.mkdir(mc_path)
-    title_path = os.path.join(mc_path, title + '.mp4')
+    title_path = os.path.join(mc_path, mc + title + '.mp4')
     if os.path.exists(title_path):
         return
     cmd = f'start {m3u8DL_dir}/N_m3u8DL-RE.exe "{url}" --save-name "{mc}{title}" --save-dir "{mc_path}" --tmp-dir "{mc_path}" --thread-count "16" --download-retry-count "15" --ffmpeg-binary-path "{ffmpeg_path}/ffmpeg.exe" --select-video "best" --auto-select true --no-date-info true --concurrent-download true --use-system-proxy false'
@@ -165,36 +170,50 @@ def process_movie(movie, vod_name):
 def worker(vod_name):
     """工作线程函数"""
     if not stop_threads.is_set():
-        try:
-            type_id, page = task_queue.get(timeout=5)  # 5秒超时
+            if vod_name:
+                movie_list_data = fetch_movie_list('', vod_name, '')
+                total = movie_list_data['total']
+                logging.info(f" {vod_name} 影视获取成功，共 {total} 条")
 
-            movie_list_data = fetch_movie_list(type_id, page)
-            total_pages = movie_list_data['pagecount']
-            logging.info(f"第 {page} 页影视列表获取成功，总页数: {total_pages}")
+                # 使用线程池处理每个电影
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    futures = []
+                    for movie in movie_list_data['list']:
+                        futures.append(executor.submit(process_movie, movie, vod_name))
 
-            # 使用线程池处理每个电影
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = []
-                for movie in movie_list_data['list']:
-                    futures.append(executor.submit(process_movie, movie, vod_name))
+                    # 等待所有电影处理完成
+                    for future in as_completed(futures):
+                        if future.result():  # 如果找到匹配的电影
+                            return  # 退出当前线程
+            else:
+                try:
+                    type_id, page = task_queue.get(timeout=5)  # 5秒超时
 
-                # 等待所有电影处理完成
-                for future in as_completed(futures):
-                    if future.result():  # 如果找到匹配的电影
-                        return  # 退出当前线程
+                    movie_list_data = fetch_movie_list(type_id, vod_name, page)
+                    total_pages = movie_list_data['pagecount']
+                    logging.info(f"第 {page} 页影视列表获取成功，总页数: {total_pages}")
 
-        except queue.Empty:
-            logging.info("队列为空，等待下一个任务...")
-            return  # 退出当前线程
-        except Exception as e:
-            logging.error(f"出现错误: {e}")
-        finally:
-            # logging.info(f"第 {page} 页处理完毕")
-            task_queue.task_done()
+                    # 使用线程池处理每个电影
+                    with ThreadPoolExecutor(max_workers=5) as executor:
+                        futures = []
+                        for movie in movie_list_data['list']:
+                            futures.append(executor.submit(process_movie, movie, vod_name))
+
+                        # 等待所有电影处理完成
+                        for future in as_completed(futures):
+                            if future.result():  # 如果找到匹配的电影
+                                return  # 退出当前线程
+                except queue.Empty:
+                    logging.info("队列为空，等待下一个任务...")
+                    return  # 退出当前线程
+                except Exception as e:
+                    logging.error(f"出现错误: {e}")
+                finally:
+                    # logging.info(f"第 {page} 页处理完毕")
+                    task_queue.task_done()
 
 
 def download_test():
-    global f, lines, info, line, attrs, title, url, futures
     with open(os.path.join(download_path, resule_file), 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
@@ -228,7 +247,7 @@ def download_test():
         urls = info['urls']
         # print(f'{mc}--{urls')
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             futures = {executor.submit(download, mc, urlAttr, ) for urlAttr in urls}
 
             for future in as_completed(futures):
@@ -240,12 +259,14 @@ def main():
 
     types = fetch_category_type()
 
-    for type in types:
-        print(f'{type[0]}.{type[1]}', end='\t')
+    for i in range(0, len(types)):
+        print(f'{i+1}.{types[i][1]}', end='\t')
     print('')
     type_id = input("请选择分类: ")  # 用户输入要查找的影视名称
 
-    type_name = types[int(type_id)-1][1]
+    select = types[int(type_id) - 1]
+    type_id = select[0]
+    type_name = select[1]
     print(f'您选择了： {type_name}')
     print('')
 
@@ -259,29 +280,44 @@ def main():
         f.flush()
         f.close()
 
-    # 获取分类的总页数
-    first_page_data = fetch_movie_list(type_id, 1)
-    total_pages = first_page_data['pagecount']
-    logging.info(f"总页数: {total_pages}")
-
-    # 将所有页码加入队列
-    for page in range(1, total_pages + 1):
-        task_queue.put((type_id, page))
-
+    max_workers = 5
+    if vod_name:
+        max_workers = 1
 
     # 使用线程池进行并发处理
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        futures = {executor.submit(worker, vod_name,) for _ in range(1, total_pages + 1)}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        if vod_name:
+            futures = {executor.submit(worker, vod_name, )}
 
-        for future in as_completed(futures):
-            if future.result():
-                logging.info("找到指定电影，停止其他线程.")
-                # 取消未完成的任务
-                for f in futures.keys():
-                    if f != future:  # 取消其他线程
-                        f.cancel()
-                break
+            for future in as_completed(futures):
+                if future.result():
+                    logging.info("停止其他线程.")
+                    # 取消未完成的任务
+                    for f in futures.keys():
+                        if f != future:  # 取消其他线程
+                            f.cancel()
+                    break
+        else:
 
+            # 获取分类的总页数
+            first_page_data = fetch_movie_list(type_id, 1)
+            total_pages = first_page_data['pagecount']
+            logging.info(f"总页数: {total_pages}")
+
+            # 将所有页码加入队列
+            for page in range(1, total_pages + 1):
+                task_queue.put((type_id, page))
+
+            futures = {executor.submit(worker, vod_name, ) for _ in range(1, total_pages + 1)}
+
+            for future in as_completed(futures):
+                if future.result():
+                    logging.info("找到指定电影，停止其他线程.")
+                    # 取消未完成的任务
+                    for f in futures.keys():
+                        if f != future:  # 取消其他线程
+                            f.cancel()
+                    break
 
     # 使用线程池进行并发下载
     print('使用线程池进行并发下载')
